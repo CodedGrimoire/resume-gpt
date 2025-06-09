@@ -1,83 +1,115 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const fs = require('fs');
-const fetch = require('node-fetch'); // ✅ Use node-fetch@2
+const fetch = require('node-fetch');
 
 const app = express();
 const PORT = 3003;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// HuggingFace free inference API URL
-const HUGGINGFACE_API_URL = 'https://api-inference.huggingface.co/models/sshleifer/distilbart-cnn-12-6';
+const HF_API_URL = 'https://api-inference.huggingface.co/models/google/flan-t5-xxl';
+const HF_API_KEY = process.env['api-key'];
 
-// Multer setup for file uploads
 const storage = multer.diskStorage({
   destination: 'uploads/',
   filename: (req, file, cb) => {
-    const uniqueName = Date.now() + '-' + file.originalname;
-    cb(null, uniqueName);
+    cb(null, Date.now() + '-' + file.originalname);
   }
 });
 
 const upload = multer({
   storage,
   fileFilter: (req, file, cb) => {
-    const isPDF = file.mimetype === 'application/pdf';
-    cb(null, isPDF);
+    cb(null, file.mimetype === 'application/pdf');
   }
 });
 
-// Health check
 app.get('/', (req, res) => {
   res.send('✅ ResumeGPT Backend is Running');
 });
 
-// Upload and analyze route
 app.post('/upload', upload.single('resume'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No PDF file uploaded' });
-    }
+    if (!req.file) return res.status(400).json({ error: 'No PDF uploaded' });
 
-    const filePath = req.file.path;
-    const dataBuffer = fs.readFileSync(filePath);
-    const pdfData = await pdfParse(dataBuffer);
-    fs.unlinkSync(filePath); // ✅ Clean up uploaded file
+    const buffer = fs.readFileSync(req.file.path);
+    const pdfData = await pdfParse(buffer);
+    fs.unlinkSync(req.file.path);
 
-    // Limit text length to avoid HuggingFace input size issues
     const inputText = pdfData.text.slice(0, 4000);
 
-    const hfResponse = await fetch(HUGGINGFACE_API_URL, {
+    const prompt = `
+You are a professional resume reviewer.
+
+Here is a resume:
+"""
+${inputText}
+"""
+
+Now, provide the following:
+
+1. Identify the job or role this resume is best suited for.
+2. Give a score out of 10 based on formatting, grammar, content, and style.
+3. Provide a brief paragraph of overall feedback.
+4. Point out any formatting or grammar issues.
+5. Suggest 3–5 improvements to help the candidate better highlight their skills and stand out.
+
+Respond clearly and concisely.
+`;
+
+    const hfResponse = await fetch(HF_API_URL, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        // Optional: use your token if hitting rate limit
-        // 'Authorization': `Bearer YOUR_TOKEN`
+        Authorization: `Bearer ${HF_API_KEY}`,
+        'Content-Type': 'application/json'
       },
-      body: JSON.stringify({ inputs: inputText })
+      body: JSON.stringify({
+        inputs: prompt,
+        parameters: {
+          max_new_tokens: 600,
+          temperature: 0.7
+        }
+      })
     });
 
     const hfData = await hfResponse.json();
-    const summary = hfData[0]?.summary_text || '⚠️ No summary generated.';
+    console.log('🧪 HuggingFace API Response:', JSON.stringify(hfData, null, 2));
+
+    // ✅ CORRECTLY extract feedback from the known response format
+    let feedback;
+    if (Array.isArray(hfData) && hfData[0]?.generated_text) {
+      feedback = hfData[0].generated_text;
+    } else if (hfData.generated_text) {
+      feedback = hfData.generated_text;
+    } else {
+      feedback = null;
+    }
+
+    if (!feedback) {
+      return res.json({
+        text: pdfData.text,
+        feedback: '⚠️ No feedback generated.',
+        raw: hfData
+      });
+    }
 
     res.json({
-      message: '✅ Resume parsed and analyzed successfully',
+      message: '✅ Resume analyzed successfully',
       text: pdfData.text,
-      summary
+      feedback
     });
+
   } catch (err) {
     console.error('❌ Error:', err);
-    res.status(500).json({ error: 'Failed to process resume' });
+    res.status(500).json({ error: 'Failed to analyze resume' });
   }
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`🟢 Server is running at http://localhost:${PORT}`);
+  console.log(`🟢 Server running at http://localhost:${PORT}`);
 });
