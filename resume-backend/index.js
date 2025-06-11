@@ -12,8 +12,9 @@ const PORT = 3003;
 app.use(cors());
 app.use(express.json());
 
-const HF_API_URL = 'https://api-inference.huggingface.co/models/google/flan-t5-xxl';
-const HF_API_KEY = process.env['api-key'];
+const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const GROQ_MODEL = 'llama3-8b-8192';
 
 const storage = multer.diskStorage({
   destination: 'uploads/',
@@ -30,7 +31,7 @@ const upload = multer({
 });
 
 app.get('/', (req, res) => {
-  res.send('✅ ResumeGPT Backend is Running');
+  res.send('✅ ResumeGPT Backend (Groq Version) is Running');
 });
 
 app.post('/upload', upload.single('resume'), async (req, res) => {
@@ -43,60 +44,92 @@ app.post('/upload', upload.single('resume'), async (req, res) => {
 
     const inputText = pdfData.text.slice(0, 4000);
 
-    const prompt = `
-You are a professional resume reviewer.
+   const prompt = `
+You are a professional resume and career reviewer.
 
-Here is a resume:
+Given the resume below (between triple quotes), analyze it and return **all of the following fields**.
+If any field is unclear or unknown, say "Not Available". Follow this exact format strictly:
+
+---
+ROLE: <The job or role this resume is best suited for>
+
+SCORE: <Score out of 10 based on formatting, grammar, content, and style>
+
+FEEDBACK: <General resume feedback paragraph>
+
+ISSUES: <Formatting, grammar, or clarity issues>
+
+SUGGESTIONS: <3–5 improvements to enhance the resume>
+
+TECHNICAL SKILLS REQUIRED: <Technical skill set required for the role>
+
+SOFT SKILLS REQUIRED: <Soft skills valued for this role>
+
+PROJECTS THAT IMPRESS RECRUITERS: <Example projects that would stand out for this role>
+
+JOB MARKET INSIGHT: <Insight on demand, salary trends, job placement rates for all levels globally>
+
+LEARNING PATHS AND CERTIFICATIONS: <Recommended courses, certificates, or topics to improve fit>
+---
+
+Here is the resume:
 """
 ${inputText}
 """
-
-Now, provide the following:
-
-1. Identify the job or role this resume is best suited for.
-2. Give a score out of 10 based on formatting, grammar, content, and style.
-3. Provide a brief paragraph of overall feedback.
-4. Point out any formatting or grammar issues.
-5. Suggest 3–5 improvements to help the candidate better highlight their skills and stand out.
-
-Respond clearly and concisely.
 `;
 
-    const hfResponse = await fetch(HF_API_URL, {
+
+    const response = await fetch(GROQ_API_URL, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${HF_API_KEY}`,
+        'Authorization': `Bearer ${GROQ_API_KEY}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        inputs: prompt,
-        parameters: {
-          max_new_tokens: 600,
-          temperature: 0.7
-        }
+        model: GROQ_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a helpful assistant that provides resume review and career guidance.'
+          },
+          {
+            role: 'user',
+            content: prompt
+          }
+        ],
+        temperature: 0.7,
+        max_tokens: 2000
       })
     });
 
-    const hfData = await hfResponse.json();
-    console.log('🧪 HuggingFace API Response:', JSON.stringify(hfData, null, 2));
-
-    // ✅ CORRECTLY extract feedback from the known response format
-    let feedback;
-    if (Array.isArray(hfData) && hfData[0]?.generated_text) {
-      feedback = hfData[0].generated_text;
-    } else if (hfData.generated_text) {
-      feedback = hfData.generated_text;
-    } else {
-      feedback = null;
+    if (!response.ok) {
+      const errText = await response.text();
+      console.error(`❌ Groq API Error [${response.status}]:`, errText);
+      return res.status(500).json({ error: `Groq API returned ${response.status}: ${errText}` });
     }
 
-    if (!feedback) {
-      return res.json({
-        text: pdfData.text,
-        feedback: '⚠️ No feedback generated.',
-        raw: hfData
-      });
-    }
+    const result = await response.json();
+    const rawText = result?.choices?.[0]?.message?.content || '';
+
+    const extract = (label) => {
+      const pattern = new RegExp(`${label}:\\s*([\\s\\S]*?)(?=\\n[A-Z ]+?:|$)`, 'i');
+      const match = rawText.match(pattern);
+      return match ? match[1].trim() : 'Not found';
+    };
+
+    const feedback = {
+      role: extract('ROLE'),
+      score: extract('SCORE'),
+      feedback: extract('FEEDBACK'),
+      issues: extract('ISSUES'),
+      suggestions: extract('SUGGESTIONS'),
+      technicalSkills: extract('TECHNICAL SKILLS REQUIRED'),
+      softSkills: extract('SOFT SKILLS REQUIRED'),
+      projects: extract('PROJECTS THAT IMPRESS RECRUITERS'),
+      marketInsight: extract('JOB MARKET INSIGHT'),
+      learningPaths: extract('LEARNING PATHS AND CERTIFICATIONS'),
+      raw: rawText
+    };
 
     res.json({
       message: '✅ Resume analyzed successfully',
@@ -105,7 +138,7 @@ Respond clearly and concisely.
     });
 
   } catch (err) {
-    console.error('❌ Error:', err);
+    console.error('❌ Server Error:', err);
     res.status(500).json({ error: 'Failed to analyze resume' });
   }
 });
